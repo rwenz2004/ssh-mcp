@@ -2,9 +2,12 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-import { Client, ClientChannel } from 'ssh2';
+import { Client, ClientChannel, SFTPWrapper } from 'ssh2';
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { resolveSshConfig } from './ssh-config-parser.js';
+import { readFile, writeFile, readdir, mkdir, stat } from 'fs/promises';
+import { join, dirname } from 'path';
 
 // Example usage: node build/index.js --host=1.2.3.4 --port=22 --user=root --password=pass --key=path/to/key --timeout=5000 --disableSudo
 function parseArgv() {
@@ -56,10 +59,39 @@ const MAX_CHARS = (() => {
   return 1000;
 })();
 
-function validateConfig(config: Record<string, string | null>) {
+// SSH config resolution — fills in missing values from ~/.ssh/config
+const NO_SSH_CONFIG = argvConfig.noConfig !== undefined;
+const SSH_CONFIG_FILE = argvConfig.configFile;
+
+let SSH_CONFIG_HOSTNAME: string | undefined;
+let SSH_CONFIG_USER: string | undefined;
+let SSH_CONFIG_PORT: number | undefined;
+let SSH_CONFIG_KEY: string | undefined;
+
+if (!NO_SSH_CONFIG && HOST) {
+  try {
+    const entry = resolveSshConfig(HOST, SSH_CONFIG_FILE || undefined);
+    if (entry) {
+      SSH_CONFIG_HOSTNAME = entry.hostName;
+      SSH_CONFIG_USER = entry.user;
+      SSH_CONFIG_PORT = entry.port;
+      SSH_CONFIG_KEY = entry.identityFile;
+    }
+  } catch (e) {
+    console.error('Warning: Failed to parse SSH config:', e);
+  }
+}
+
+// Resolved connection parameters (SSH config as fallback, CLI takes priority)
+const CONN_HOST = SSH_CONFIG_HOSTNAME ?? HOST;
+const CONN_PORT = PORT;
+const CONN_USER = SSH_CONFIG_USER ?? USER;
+const CONN_KEY = SSH_CONFIG_KEY ?? KEY;
+
+function validateConfig(config: Record<string, string | null>, sshUser?: string) {
   const errors = [];
   if (!config.host) errors.push('Missing required --host');
-  if (!config.user) errors.push('Missing required --user');
+  if (!config.user && !sshUser) errors.push('Missing required --user');
   if (config.port && isNaN(Number(config.port))) errors.push('Invalid --port');
   if (errors.length > 0) {
     throw new Error('Configuration error:\n' + errors.join('\n'));
@@ -67,7 +99,7 @@ function validateConfig(config: Record<string, string | null>) {
 }
 
 if (isCliEnabled) {
-  validateConfig(argvConfig);
+  validateConfig(argvConfig, SSH_CONFIG_USER);
 }
 
 // Command sanitization and validation
@@ -124,6 +156,8 @@ export class SSHConnectionManager {
   private suShell: any = null;  // Store the elevated shell session
   private suPromise: Promise<void> | null = null;
   private isElevated = false;  // Track if we're in su mode
+  private sftpSession: SFTPWrapper | null = null;
+  private sftpPromise: Promise<SFTPWrapper> | null = null;
 
   constructor(config: SSHConfig) {
     this.sshConfig = config;
@@ -323,7 +357,145 @@ export class SSHConnectionManager {
     return this.conn;
   }
 
+  async sftp(): Promise<SFTPWrapper> {
+    if (this.sftpSession) return this.sftpSession;
+    if (this.sftpPromise) return this.sftpPromise;
+
+    this.sftpPromise = new Promise((resolve, reject) => {
+      this.getConnection().sftp((err, sftp) => {
+        if (err) {
+          this.sftpPromise = null;
+          reject(new McpError(ErrorCode.InternalError, `SFTP session error: ${err.message}`));
+          return;
+        }
+        this.sftpSession = sftp;
+        this.sftpPromise = null;
+        resolve(sftp);
+      });
+    });
+
+    return this.sftpPromise;
+  }
+
+  async uploadFile(localPath: string, remotePath: string): Promise<number> {
+    const sftp = await this.sftp();
+    const { size } = await stat(localPath);
+
+    return new Promise((resolve, reject) => {
+      sftp.fastPut(localPath, remotePath, (err) => {
+        if (err) {
+          reject(new McpError(ErrorCode.InternalError, `Upload failed: ${err.message}`));
+          return;
+        }
+        resolve(size);
+      });
+    });
+  }
+
+  async uploadDirectory(localPath: string, remotePath: string): Promise<number> {
+    const sftp = await this.sftp();
+    let totalBytes = 0;
+
+    const ensureRemoteDir = async (dir: string): Promise<void> => {
+      await new Promise<void>((resolve, reject) => {
+        sftp.mkdir(dir, (err) => {
+          if (err && (err as any).code !== 4) { // 4 = EEXIST
+            reject(new McpError(ErrorCode.InternalError, `Failed to create remote dir ${dir}: ${err.message}`));
+            return;
+          }
+          resolve();
+        });
+      });
+    };
+
+    const walk = async (localDir: string, remoteDir: string): Promise<void> => {
+      await ensureRemoteDir(remoteDir);
+      const entries = await readdir(localDir, { withFileTypes: true });
+
+      for (const entry of entries) {
+        const localEntry = join(localDir, entry.name);
+        const remoteEntry = remoteDir + '/' + entry.name;
+
+        if (entry.isDirectory()) {
+          await walk(localEntry, remoteEntry);
+        } else if (entry.isFile()) {
+          const size = await this.uploadFile(localEntry, remoteEntry);
+          totalBytes += size;
+        }
+      }
+    };
+
+    await walk(localPath, remotePath);
+    return totalBytes;
+  }
+
+  async downloadFile(remotePath: string, localPath: string): Promise<number> {
+    const sftp = await this.sftp();
+
+    const size = await new Promise<number>((resolve, reject) => {
+      sftp.stat(remotePath, (err, stats) => {
+        if (err) {
+          reject(new McpError(ErrorCode.InternalError, `Remote file stat failed: ${err.message}`));
+          return;
+        }
+        resolve(stats.size);
+      });
+    });
+
+    await mkdir(dirname(localPath), { recursive: true });
+
+    return new Promise((resolve, reject) => {
+      sftp.fastGet(remotePath, localPath, (err) => {
+        if (err) {
+          reject(new McpError(ErrorCode.InternalError, `Download failed: ${err.message}`));
+          return;
+        }
+        resolve(size);
+      });
+    });
+  }
+
+  async downloadDirectory(remotePath: string, localPath: string): Promise<number> {
+    const sftp = await this.sftp();
+    let totalBytes = 0;
+
+    const walk = async (remoteDir: string, localDir: string): Promise<void> => {
+      await mkdir(localDir, { recursive: true });
+
+      const entries = await new Promise<{ filename: string; longname: string; attrs: any }[]>((resolve, reject) => {
+        sftp.readdir(remoteDir, (err, list) => {
+          if (err) {
+            reject(new McpError(ErrorCode.InternalError, `Failed to read remote dir ${remoteDir}: ${err.message}`));
+            return;
+          }
+          resolve(list);
+        });
+      });
+
+      for (const entry of entries) {
+        if (entry.filename === '.' || entry.filename === '..') continue;
+        const remoteEntry = remoteDir + '/' + entry.filename;
+        const localEntry = join(localDir, entry.filename);
+
+        if (entry.attrs.isDirectory()) {
+          totalBytes += await this.downloadDirectory(remoteEntry, localEntry);
+        } else {
+          const size = await this.downloadFile(remoteEntry, localEntry);
+          totalBytes += size;
+        }
+      }
+    };
+
+    await walk(remotePath, localPath);
+    return totalBytes;
+  }
+
   close(): void {
+    if (this.sftpSession) {
+      try { this.sftpSession.end(); } catch (e) { /* ignore */ }
+      this.sftpSession = null;
+      this.sftpPromise = null;
+    }
     if (this.conn) {
       if (this.suShell) {
         try { this.suShell.end(); } catch (e) { /* ignore */ }
@@ -338,43 +510,46 @@ export class SSHConnectionManager {
 
 let connectionManager: SSHConnectionManager | null = null;
 
-const server = new McpServer({
-  name: 'SSH MCP Server',
-  version: '1.5.0',
-  capabilities: {
-    resources: {},
-    tools: {},
-  },
-});
-
-server.tool(
-  "exec",
-  "Execute a shell command on the remote SSH server and return the output.",
+const server = new McpServer(
   {
+    name: 'SSH MCP Server',
+    version: '1.6.0',
+  },
+  {
+    capabilities: {
+      resources: {},
+      tools: {},
+    },
+  },
+);
+
+server.registerTool("exec", {
+  description: "Execute a shell command on the remote SSH server and return the output.",
+  inputSchema: {
     command: z.string().describe("Shell command to execute on the remote SSH server"),
     description: z.string().optional().describe("Optional description of what this command will do"),
   },
-  async ({ command, description }) => {
+}, async ({ command, description }) => {
     // Sanitize command input
     const sanitizedCommand = sanitizeCommand(command);
 
     try {
       // Initialize connection manager if not already done
       if (!connectionManager) {
-        if (!HOST || !USER) {
+        if (!CONN_HOST || !CONN_USER) {
           throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
         }
         const sshConfig: SSHConfig = {
-          host: HOST,
-          port: PORT,
-          username: USER,
+          host: CONN_HOST,
+          port: CONN_PORT,
+          username: CONN_USER,
         };
 
         if (PASSWORD) {
           sshConfig.password = PASSWORD;
-        } else if (KEY) {
+        } else if (CONN_KEY) {
           const fs = await import('fs/promises');
-          sshConfig.privateKey = await fs.readFile(KEY, 'utf8');
+          sshConfig.privateKey = await fs.readFile(CONN_KEY, 'utf8');
         }
 
         if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
@@ -419,32 +594,31 @@ server.tool(
 
 // Expose sudo-exec tool unless explicitly disabled
 if (!DISABLE_SUDO) {
-  server.tool(
-    "sudo-exec",
-    "Execute a shell command on the remote SSH server using sudo. Will use sudo password if provided, otherwise assumes passwordless sudo.",
-    {
+  server.registerTool("sudo-exec", {
+    description: "Execute a shell command on the remote SSH server using sudo. Will use sudo password if provided, otherwise assumes passwordless sudo.",
+    inputSchema: {
       command: z.string().describe("Shell command to execute with sudo on the remote SSH server"),
       description: z.string().optional().describe("Optional description of what this command will do"),
     },
-    async ({ command, description }) => {
+  }, async ({ command, description }) => {
       const sanitizedCommand = sanitizeCommand(command);
 
       try {
         if (!connectionManager) {
-          if (!HOST || !USER) {
+          if (!CONN_HOST || !CONN_USER) {
             throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
           }
 
           const sshConfig: SSHConfig = {
-            host: HOST,
-            port: PORT || 22,
-            username: USER,
+            host: CONN_HOST,
+            port: CONN_PORT || 22,
+            username: CONN_USER,
           };
           if (PASSWORD) {
             sshConfig.password = PASSWORD;
-          } else if (KEY) {
+          } else if (CONN_KEY) {
             const fs = await import('fs/promises');
-            sshConfig.privateKey = await fs.readFile(KEY, 'utf8');
+            sshConfig.privateKey = await fs.readFile(CONN_KEY, 'utf8');
           }
           if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
             sshConfig.suPassword = sanitizePassword(SUPASSWORD);
@@ -495,6 +669,110 @@ if (!DISABLE_SUDO) {
     }
   );
 }
+
+async function initConnectionManagerIfNeeded(): Promise<SSHConnectionManager> {
+  if (!connectionManager) {
+    if (!CONN_HOST || !CONN_USER) {
+      throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
+    }
+    const config: SSHConfig = {
+      host: CONN_HOST,
+      port: CONN_PORT,
+      username: CONN_USER,
+    };
+    if (PASSWORD) {
+      config.password = PASSWORD;
+    } else if (CONN_KEY) {
+      const fsMod = await import('fs/promises');
+      config.privateKey = await fsMod.readFile(CONN_KEY, 'utf8');
+    }
+    if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
+      config.suPassword = sanitizePassword(SUPASSWORD);
+    }
+    if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) {
+      config.sudoPassword = sanitizePassword(SUDOPASSWORD);
+    }
+    connectionManager = new SSHConnectionManager(config);
+  }
+  return connectionManager;
+}
+
+server.registerTool("upload", {
+  description: "Upload a file or directory to the remote SSH server via SFTP. Directories are uploaded recursively automatically.",
+  inputSchema: {
+    source: z.string().describe("Local file path or directory path"),
+    destination: z.string().describe("Remote destination path"),
+  },
+}, async ({ source, destination }) => {
+  if (!source || !destination) {
+    throw new McpError(ErrorCode.InvalidParams, 'source and destination are required');
+  }
+
+  const localPath = source;
+  const remotePath = destination;
+
+  let localStats;
+  try {
+    localStats = await stat(localPath);
+  } catch (e: any) {
+    throw new McpError(ErrorCode.InvalidParams, `Local path not accessible: ${e.message}`);
+  }
+
+  const mgr = await initConnectionManagerIfNeeded();
+  await mgr.ensureConnected();
+
+  let totalBytes: number;
+  if (localStats.isDirectory()) {
+    totalBytes = await mgr.uploadDirectory(localPath, remotePath);
+  } else {
+    totalBytes = await mgr.uploadFile(localPath, remotePath);
+  }
+
+  return {
+    content: [{ type: 'text', text: `Uploaded ${totalBytes} bytes to ${remotePath}` }],
+  };
+});
+
+server.registerTool("download", {
+  description: "Download a file or directory from the remote SSH server via SFTP. Directories are downloaded recursively automatically.",
+  inputSchema: {
+    source: z.string().describe("Remote file path or directory path"),
+    destination: z.string().describe("Local destination path"),
+  },
+}, async ({ source, destination }) => {
+  if (!source || !destination) {
+    throw new McpError(ErrorCode.InvalidParams, 'source and destination are required');
+  }
+
+  const remotePath = source;
+  const localPath = destination;
+
+  const mgr = await initConnectionManagerIfNeeded();
+  await mgr.ensureConnected();
+
+  const sftp = await mgr.sftp();
+
+  const remoteStats = await new Promise<any>((resolve, reject) => {
+    sftp.stat(remotePath, (err, stats) => {
+      if (err) {
+        reject(new McpError(ErrorCode.InvalidParams, `Remote path not accessible: ${err.message}`));
+        return;
+      }
+      resolve(stats);
+    });
+  });
+
+  let totalBytes: number;
+  if (remoteStats.isDirectory()) {
+    totalBytes = await mgr.downloadDirectory(remotePath, localPath);
+  } else {
+    totalBytes = await mgr.downloadFile(remotePath, localPath);
+  }
+
+  return {
+    content: [{ type: 'text', text: `Downloaded ${totalBytes} bytes to ${localPath}` }],
+  };
+});
 
 // New function that uses persistent connection
 export async function execSshCommandWithConnection(manager: SSHConnectionManager, command: string, stdin?: string): Promise<{ [x: string]: unknown; content: ({ [x: string]: unknown; type: "text"; text: string; } | { [x: string]: unknown; type: "image"; data: string; mimeType: string; } | { [x: string]: unknown; type: "audio"; data: string; mimeType: string; } | { [x: string]: unknown; type: "resource"; resource: any; })[] }> {
