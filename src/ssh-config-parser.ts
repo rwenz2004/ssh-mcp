@@ -2,6 +2,19 @@ import { readFileSync, existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 
+const DEFAULT_KEY_NAMES = ['id_ed25519', 'id_ecdsa', 'id_rsa', 'id_dsa'];
+
+export function discoverDefaultSshKey(): string | undefined {
+  const sshDir = join(homedir(), '.ssh');
+  for (const name of DEFAULT_KEY_NAMES) {
+    const keyPath = join(sshDir, name);
+    if (existsSync(keyPath)) {
+      return keyPath;
+    }
+  }
+  return undefined;
+}
+
 export interface SshConfigEntry {
   hostName?: string;
   user?: string;

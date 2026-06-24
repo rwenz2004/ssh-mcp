@@ -82,18 +82,20 @@
 You can configure your IDE or LLM like Cursor, Windsurf, Claude Desktop to use this MCP Server.
 
 **Required Parameters:**
-- `host`: Hostname or IP of the Linux or Windows server
-- `user`: SSH username
+- `host`: Hostname or IP of the remote server, optionally with username in `user@host` format (e.g. `root@1.2.3.4`, `admin@example.com`). If no username is specified in the host, it is resolved from `~/.ssh/config` `User` directive or the current OS user.
 
 **Optional Parameters:**
+- `password`: SSH password (if not using key-based auth)
+- `key`: Path to private SSH key (auto-detected from `~/.ssh/config` or default locations like `~/.ssh/id_ed25519` if not specified)
 - `port`: SSH port (default: 22)
-- `password`: SSH password (or use `key` for key-based auth)
-- `key`: Path to private SSH key
 - `sudoPassword`: Password for sudo elevation (when executing commands with sudo)
 - `suPassword`: Password for su elevation (when you need a persistent root shell)
 - `timeout`: Command execution timeout in milliseconds (default: 60000ms = 1 minute)
 - `maxChars`: Maximum allowed characters for the `command` input (default: 1000). Use `none` or `0` to disable the limit.
 - `disableSudo`: Flag to disable the `sudo-exec` tool completely. Useful when sudo access is not needed or not available.
+
+Username resolution priority: `user@host` in `--host` > `~/.ssh/config` `User` directive > current OS user.
+SSH key resolution priority: `--key` CLI argument > `~/.ssh/config` `IdentityFile` > standard locations (`~/.ssh/id_ed25519`, `~/.ssh/id_ecdsa`, `~/.ssh/id_rsa`, `~/.ssh/id_dsa`). If no key is found and `--password` is not provided, the server will report an error (no interactive prompt).
 
 
 ```commandline
@@ -105,9 +107,8 @@ You can configure your IDE or LLM like Cursor, Windsurf, Claude Desktop to use t
                 "ssh-mcp",
                 "-y",
                 "--",
-                "--host=1.2.3.4",
+                "--host=root@1.2.3.4",
                 "--port=22",
-                "--user=root",
                 "--password=pass",
                 "--key=path/to/key",
                 "--timeout=30000",
@@ -125,29 +126,29 @@ You can add this MCP server to Claude Code using the `claude mcp add` command. T
 **Basic Installation:**
 
 ```bash
-claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=YOUR_HOST --user=YOUR_USER --password=YOUR_PASSWORD
+claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=YOUR_USER@YOUR_HOST --password=YOUR_PASSWORD
 ```
 
 **Installation Examples:**
 
 **With Password Authentication:**
 ```bash
-claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=192.168.1.100 --port=22 --user=admin --password=your_password
+claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=admin@192.168.1.100 --port=22 --password=your_password
 ```
 
 **With SSH Key Authentication:**
 ```bash
-claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=example.com --user=root --key=/path/to/private/key
+claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=root@example.com --key=/path/to/private/key
 ```
 
 **With Custom Timeout and No Character Limit:**
 ```bash
-claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=192.168.1.100 --user=admin --password=your_password --timeout=120000 --maxChars=none
+claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=admin@192.168.1.100 --password=your_password --timeout=120000 --maxChars=none
 ```
 
 **With Sudo and Su Support:**
 ```bash
-claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=192.168.1.100 --user=admin --password=your_password --sudoPassword=sudo_pass --suPassword=root_pass
+claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=admin@192.168.1.100 --password=your_password --sudoPassword=sudo_pass --suPassword=root_pass
 ```
 
 **Installation Scopes:**
@@ -156,17 +157,17 @@ You can specify the scope when adding the server:
 
 - **Local scope** (default): For personal use in the current project
   ```bash
-  claude mcp add --transport stdio ssh-mcp --scope local -- npx -y ssh-mcp -- --host=YOUR_HOST --user=YOUR_USER --password=YOUR_PASSWORD
+  claude mcp add --transport stdio ssh-mcp --scope local -- npx -y ssh-mcp -- --host=YOUR_HOST --password=YOUR_PASSWORD
   ```
 
 - **Project scope**: Share with your team via `.mcp.json` file
   ```bash
-  claude mcp add --transport stdio ssh-mcp --scope project -- npx -y ssh-mcp -- --host=YOUR_HOST --user=YOUR_USER --password=YOUR_PASSWORD
+  claude mcp add --transport stdio ssh-mcp --scope project -- npx -y ssh-mcp -- --host=YOUR_HOST --password=YOUR_PASSWORD
   ```
 
 - **User scope**: Available across all your projects
   ```bash
-  claude mcp add --transport stdio ssh-mcp --scope user -- npx -y ssh-mcp -- --host=YOUR_HOST --user=YOUR_USER --password=YOUR_PASSWORD
+  claude mcp add --transport stdio ssh-mcp --scope user -- npx -y ssh-mcp -- --host=YOUR_HOST --password=YOUR_PASSWORD
   ```
 
 

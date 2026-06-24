@@ -17,9 +17,8 @@ beforeAll(() => {
 function runMcpCommand(command: string, extraArgs: string[] = [], toolName = 'sudo-exec'): Promise<any> {
   const args = [
     testServerPath,
-    '--host=127.0.0.1',
+    '--host=test@127.0.0.1',
     '--port=2222',
-    '--user=test',
     '--password=secret',
     '--timeout=60000',
     ...extraArgs,

@@ -2,15 +2,12 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
-    "ssh-mcp-server": {
+    "ssh-mcp": {
       "type": "local",
       "command": [
-        "node",
-        "build/index.js",
-        "--host=127.0.0.1",
-        "--port=2222",
-        "--user=test",
-        "--password=secret",
+        "ssh-mcp",
+        "--host=root@x86-server",
+        "--key=/home/ut006206@uos/.ssh/id_ed25519",
         "--timeout=60000"
       ],
       "enabled": true,

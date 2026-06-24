@@ -5,11 +5,12 @@ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { Client, ClientChannel, SFTPWrapper } from 'ssh2';
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { resolveSshConfig } from './ssh-config-parser.js';
+import { resolveSshConfig, discoverDefaultSshKey } from './ssh-config-parser.js';
 import { readFile, writeFile, readdir, mkdir, stat } from 'fs/promises';
 import { join, dirname } from 'path';
+import { userInfo } from 'os';
 
-// Example usage: node build/index.js --host=1.2.3.4 --port=22 --user=root --password=pass --key=path/to/key --timeout=5000 --disableSudo
+// Example usage: node build/index.js --host=root@1.2.3.4 --port=22 --password=pass --key=path/to/key --timeout=5000 --disableSudo
 function parseArgv() {
   const args = process.argv.slice(2);
   const config: Record<string, string | null> = {};
@@ -32,8 +33,6 @@ const isCliEnabled = process.env.SSH_MCP_DISABLE_MAIN !== '1';
 const argvConfig = (isCliEnabled || isTestMode) ? parseArgv() : {} as Record<string, string>;
 
 const HOST = argvConfig.host;
-const PORT = argvConfig.port ? parseInt(argvConfig.port) : 22;
-const USER = argvConfig.user;
 const PASSWORD = argvConfig.password;
 const SUPASSWORD = argvConfig.suPassword;
 const SUDOPASSWORD = argvConfig.sudoPassword;
@@ -59,7 +58,21 @@ const MAX_CHARS = (() => {
   return 1000;
 })();
 
+// Parse user@host from --host (same format as ssh/scp)
+let PARSED_HOST: string | undefined;
+let PARSED_USER: string | undefined;
+if (HOST) {
+  const atIndex = HOST.lastIndexOf('@');
+  if (atIndex !== -1) {
+    PARSED_USER = HOST.slice(0, atIndex);
+    PARSED_HOST = HOST.slice(atIndex + 1);
+  } else {
+    PARSED_HOST = HOST;
+  }
+}
+
 // SSH config resolution — fills in missing values from ~/.ssh/config
+// Use bare hostname (without user) for SSH config matching
 const NO_SSH_CONFIG = argvConfig.noConfig !== undefined;
 const SSH_CONFIG_FILE = argvConfig.configFile;
 
@@ -68,9 +81,9 @@ let SSH_CONFIG_USER: string | undefined;
 let SSH_CONFIG_PORT: number | undefined;
 let SSH_CONFIG_KEY: string | undefined;
 
-if (!NO_SSH_CONFIG && HOST) {
+if (!NO_SSH_CONFIG && PARSED_HOST) {
   try {
-    const entry = resolveSshConfig(HOST, SSH_CONFIG_FILE || undefined);
+    const entry = resolveSshConfig(PARSED_HOST, SSH_CONFIG_FILE || undefined);
     if (entry) {
       SSH_CONFIG_HOSTNAME = entry.hostName;
       SSH_CONFIG_USER = entry.user;
@@ -82,16 +95,19 @@ if (!NO_SSH_CONFIG && HOST) {
   }
 }
 
-// Resolved connection parameters (SSH config as fallback, CLI takes priority)
-const CONN_HOST = SSH_CONFIG_HOSTNAME ?? HOST;
-const CONN_PORT = PORT;
-const CONN_USER = SSH_CONFIG_USER ?? USER;
-const CONN_KEY = SSH_CONFIG_KEY ?? KEY;
+// Resolved connection parameters:
+// - host:   SSH config HostName → CLI --host (bare hostname part)
+// - port:   CLI --port → SSH config Port → default 22
+// - user:   user@host in --host → SSH config User → current OS user
+// - key:    CLI --key → SSH config IdentityFile → auto-discovery
+const CONN_HOST = SSH_CONFIG_HOSTNAME ?? PARSED_HOST;
+const CONN_PORT = argvConfig.port ? parseInt(argvConfig.port) : (SSH_CONFIG_PORT ?? 22);
+const CONN_USER = PARSED_USER ?? SSH_CONFIG_USER ?? userInfo().username;
+const CONN_KEY = KEY ?? SSH_CONFIG_KEY;
 
-function validateConfig(config: Record<string, string | null>, sshUser?: string) {
+function validateConfig(config: Record<string, string | null>) {
   const errors = [];
   if (!config.host) errors.push('Missing required --host');
-  if (!config.user && !sshUser) errors.push('Missing required --user');
   if (config.port && isNaN(Number(config.port))) errors.push('Invalid --port');
   if (errors.length > 0) {
     throw new Error('Configuration error:\n' + errors.join('\n'));
@@ -99,7 +115,7 @@ function validateConfig(config: Record<string, string | null>, sshUser?: string)
 }
 
 if (isCliEnabled) {
-  validateConfig(argvConfig, SSH_CONFIG_USER);
+  validateConfig(argvConfig);
 }
 
 // Command sanitization and validation
@@ -129,6 +145,48 @@ function sanitizePassword(password: string | undefined): string | undefined {
   // minimal check, do not log or modify content
   if (password.length === 0) return undefined;
   return password;
+}
+
+async function buildSshConfig(extras?: {
+  suPassword?: string | null;
+  sudoPassword?: string | null;
+}): Promise<SSHConfig> {
+  if (!CONN_HOST) {
+    throw new McpError(ErrorCode.InvalidParams, 'Missing required host');
+  }
+  if (!CONN_USER) {
+    throw new McpError(ErrorCode.InvalidParams, 'Missing required username');
+  }
+
+  const config: SSHConfig = {
+    host: CONN_HOST,
+    port: CONN_PORT,
+    username: CONN_USER,
+  };
+
+  if (PASSWORD) {
+    config.password = PASSWORD;
+  } else {
+    const keyPath = CONN_KEY || discoverDefaultSshKey();
+    if (keyPath) {
+      const fs = await import('fs/promises');
+      config.privateKey = await fs.readFile(keyPath, 'utf8');
+    } else {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'No authentication method available. Provide --password or --key, or ensure an SSH key exists at ~/.ssh/ (id_ed25519, id_ecdsa, id_rsa, id_dsa)',
+      );
+    }
+  }
+
+  if (extras?.suPassword !== undefined && extras?.suPassword !== null) {
+    config.suPassword = sanitizePassword(extras.suPassword);
+  }
+  if (extras?.sudoPassword !== undefined && extras?.sudoPassword !== null) {
+    config.sudoPassword = sanitizePassword(extras.sudoPassword);
+  }
+
+  return config;
 }
 
 // Escape command for use in shell contexts (like pkill)
@@ -513,7 +571,7 @@ let connectionManager: SSHConnectionManager | null = null;
 const server = new McpServer(
   {
     name: 'SSH MCP Server',
-    version: '1.6.0',
+    version: '1.6.1',
   },
   {
     capabilities: {
@@ -536,26 +594,11 @@ server.registerTool("exec", {
     try {
       // Initialize connection manager if not already done
       if (!connectionManager) {
-        if (!CONN_HOST || !CONN_USER) {
-          throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
-        }
-        const sshConfig: SSHConfig = {
-          host: CONN_HOST,
-          port: CONN_PORT,
-          username: CONN_USER,
-        };
-
-        if (PASSWORD) {
-          sshConfig.password = PASSWORD;
-        } else if (CONN_KEY) {
-          const fs = await import('fs/promises');
-          sshConfig.privateKey = await fs.readFile(CONN_KEY, 'utf8');
-        }
-
-        if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
-          sshConfig.suPassword = sanitizePassword(SUPASSWORD);
-        }
-        connectionManager = new SSHConnectionManager(sshConfig);
+        connectionManager = new SSHConnectionManager(
+          await buildSshConfig({
+            suPassword: SUPASSWORD,
+          }),
+        );
       }
 
       // Ensure connection is active (reconnect if needed)
@@ -605,28 +648,12 @@ if (!DISABLE_SUDO) {
 
       try {
         if (!connectionManager) {
-          if (!CONN_HOST || !CONN_USER) {
-            throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
-          }
-
-          const sshConfig: SSHConfig = {
-            host: CONN_HOST,
-            port: CONN_PORT || 22,
-            username: CONN_USER,
-          };
-          if (PASSWORD) {
-            sshConfig.password = PASSWORD;
-          } else if (CONN_KEY) {
-            const fs = await import('fs/promises');
-            sshConfig.privateKey = await fs.readFile(CONN_KEY, 'utf8');
-          }
-          if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
-            sshConfig.suPassword = sanitizePassword(SUPASSWORD);
-          }
-          if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) {
-            sshConfig.sudoPassword = sanitizePassword(SUDOPASSWORD);
-          }
-          connectionManager = new SSHConnectionManager(sshConfig);
+          connectionManager = new SSHConnectionManager(
+            await buildSshConfig({
+              suPassword: SUPASSWORD,
+              sudoPassword: SUDOPASSWORD,
+            }),
+          );
         }
 
         await connectionManager.ensureConnected();
@@ -672,27 +699,12 @@ if (!DISABLE_SUDO) {
 
 async function initConnectionManagerIfNeeded(): Promise<SSHConnectionManager> {
   if (!connectionManager) {
-    if (!CONN_HOST || !CONN_USER) {
-      throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
-    }
-    const config: SSHConfig = {
-      host: CONN_HOST,
-      port: CONN_PORT,
-      username: CONN_USER,
-    };
-    if (PASSWORD) {
-      config.password = PASSWORD;
-    } else if (CONN_KEY) {
-      const fsMod = await import('fs/promises');
-      config.privateKey = await fsMod.readFile(CONN_KEY, 'utf8');
-    }
-    if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
-      config.suPassword = sanitizePassword(SUPASSWORD);
-    }
-    if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) {
-      config.sudoPassword = sanitizePassword(SUDOPASSWORD);
-    }
-    connectionManager = new SSHConnectionManager(config);
+    connectionManager = new SSHConnectionManager(
+      await buildSshConfig({
+        suPassword: SUPASSWORD,
+        sudoPassword: SUDOPASSWORD,
+      }),
+    );
   }
   return connectionManager;
 }
