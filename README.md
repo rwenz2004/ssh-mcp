@@ -88,6 +88,7 @@ You can configure your IDE or LLM like Cursor, Windsurf, Claude Desktop to use t
 - `password`: SSH password (if not using key-based auth)
 - `key`: Path to private SSH key (auto-detected from `~/.ssh/config` or default locations like `~/.ssh/id_ed25519` if not specified)
 - `port`: SSH port (default: 22)
+- `jump`: Jump host(s) / bastion server(s) to tunnel through, in `user@host:port` format. Multiple hops are comma-separated (e.g. `admin@gateway.com:2222,user@bastion.internal`). Authentication is reused from the target connection (`--password` or `--key`).
 - `sudoPassword`: Password for sudo elevation (when executing commands with sudo)
 - `suPassword`: Password for su elevation (when you need a persistent root shell)
 - `timeout`: Command execution timeout in milliseconds (default: 60000ms = 1 minute)
@@ -111,6 +112,7 @@ SSH key resolution priority: `--key` CLI argument > `~/.ssh/config` `IdentityFil
                 "--port=22",
                 "--password=pass",
                 "--key=path/to/key",
+                "--jump=admin@gateway.com:2222",
                 "--timeout=30000",
                 "--maxChars=none"
             ]
@@ -149,6 +151,11 @@ claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=admin@192.1
 **With Sudo and Su Support:**
 ```bash
 claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=admin@192.168.1.100 --password=your_password --sudoPassword=sudo_pass --suPassword=root_pass
+```
+
+**With Jump Host (Bastion):**
+```bash
+claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=root@10.0.0.5 --jump=admin@gateway.example.com:2222 --key=~/.ssh/id_ed25519
 ```
 
 **Installation Scopes:**

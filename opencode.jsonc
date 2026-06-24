@@ -1,4 +1,4 @@
-// Added for testing purposes, requires docker compose to run
+// Test config for jump host feature: test host reachable via x86-server bastion
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
@@ -6,7 +6,8 @@
       "type": "local",
       "command": [
         "ssh-mcp",
-        "--host=root@x86-server",
+        "--host=test",
+        "--jump=x86-server",
         "--key=/home/ut006206@uos/.ssh/id_ed25519",
         "--timeout=60000"
       ],

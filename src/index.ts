@@ -10,7 +10,7 @@ import { readFile, writeFile, readdir, mkdir, stat } from 'fs/promises';
 import { join, dirname } from 'path';
 import { userInfo } from 'os';
 
-// Example usage: node build/index.js --host=root@1.2.3.4 --port=22 --password=pass --key=path/to/key --timeout=5000 --disableSudo
+// Example usage: node build/index.js --host=root@1.2.3.4 --port=22 --password=pass --key=path/to/key --jump=admin@gateway.com:2222 --timeout=5000 --disableSudo
 function parseArgv() {
   const args = process.argv.slice(2);
   const config: Record<string, string | null> = {};
@@ -28,6 +28,41 @@ function parseArgv() {
   }
   return config;
 }
+
+export interface JumpHost {
+  user?: string;
+  host: string;
+  port: number;
+}
+
+export function parseJumpHosts(raw: string): JumpHost[] {
+  return raw.split(',').map(entry => {
+    const trimmed = entry.trim();
+    if (!trimmed) return null;
+
+    let user: string | undefined;
+    let host = trimmed;
+    let port = 22;
+
+    const atIndex = trimmed.lastIndexOf('@');
+    if (atIndex !== -1) {
+      user = trimmed.slice(0, atIndex);
+      host = trimmed.slice(atIndex + 1);
+    }
+
+    const colonIndex = host.lastIndexOf(':');
+    if (colonIndex !== -1) {
+      const portStr = host.slice(colonIndex + 1);
+      const parsedPort = parseInt(portStr, 10);
+      if (!isNaN(parsedPort) && parsedPort > 0) {
+        port = parsedPort;
+        host = host.slice(0, colonIndex);
+      }
+    }
+
+    return { user, host, port } as JumpHost;
+  }).filter((j): j is JumpHost => j !== null && !!j.host);
+}
 const isTestMode = process.env.SSH_MCP_TEST === '1';
 const isCliEnabled = process.env.SSH_MCP_DISABLE_MAIN !== '1';
 const argvConfig = (isCliEnabled || isTestMode) ? parseArgv() : {} as Record<string, string>;
@@ -38,6 +73,8 @@ const SUPASSWORD = argvConfig.suPassword;
 const SUDOPASSWORD = argvConfig.sudoPassword;
 const DISABLE_SUDO = argvConfig.disableSudo !== undefined;
 const KEY = argvConfig.key;
+const JUMP_RAW = argvConfig.jump;
+const JUMP_HOSTS = JUMP_RAW ? parseJumpHosts(JUMP_RAW) : [];
 const DEFAULT_TIMEOUT = argvConfig.timeout ? parseInt(argvConfig.timeout) : 60000; // 60 seconds default timeout
 // Max characters configuration:
 // - Default: 1000 characters
@@ -186,6 +223,10 @@ async function buildSshConfig(extras?: {
     config.sudoPassword = sanitizePassword(extras.sudoPassword);
   }
 
+  if (JUMP_HOSTS.length > 0) {
+    config.jumpHosts = JUMP_HOSTS;
+  }
+
   return config;
 }
 
@@ -204,6 +245,7 @@ export interface SSHConfig {
   privateKey?: string;
   suPassword?: string;
   sudoPassword?: string;  // Password for sudo commands specifically (if different from suPassword)
+  jumpHosts?: JumpHost[];
 }
 
 export class SSHConnectionManager {
@@ -216,6 +258,7 @@ export class SSHConnectionManager {
   private isElevated = false;  // Track if we're in su mode
   private sftpSession: SFTPWrapper | null = null;
   private sftpPromise: Promise<SFTPWrapper> | null = null;
+  private intermediateConns: Client[] = [];  // Jump host intermediate connections
 
   constructor(config: SSHConfig) {
     this.sshConfig = config;
@@ -231,7 +274,18 @@ export class SSHConnectionManager {
     }
 
     this.isConnecting = true;
-    this.connectionPromise = new Promise((resolve, reject) => {
+
+    if (this.sshConfig.jumpHosts && this.sshConfig.jumpHosts.length > 0) {
+      this.connectionPromise = this.connectThroughJumpHosts();
+    } else {
+      this.connectionPromise = this.connectDirect();
+    }
+
+    return this.connectionPromise;
+  }
+
+  private connectDirect(): Promise<void> {
+    return new Promise((resolve, reject) => {
       this.conn = new Client();
 
       const timeoutId = setTimeout(() => {
@@ -286,8 +340,142 @@ export class SSHConnectionManager {
 
       this.conn.connect(this.sshConfig);
     });
+  }
 
-    return this.connectionPromise;
+  private async connectThroughJumpHosts(): Promise<void> {
+    const jumps = this.sshConfig.jumpHosts!;
+    const auth = {
+      password: this.sshConfig.password,
+      privateKey: this.sshConfig.privateKey,
+    };
+
+    // Build the full hop chain: [jump1, jump2, ..., target]
+    const targetHop = {
+      user: this.sshConfig.username,
+      host: this.sshConfig.host,
+      port: this.sshConfig.port,
+    };
+    const chain = [...jumps, targetHop];
+
+    let currentConn: Client | null = null;
+    let currentSock: any = null;
+
+    for (let i = 0; i < chain.length; i++) {
+      const hop = chain[i];
+      const isLast = i === chain.length - 1;
+
+      // Resolve username for this hop: user@host → SSH config → current OS user
+      let hopUser = hop.user;
+      let hopHost = hop.host;
+      let hopPort = hop.port;
+
+      if (!hopUser) {
+        // Try SSH config for this host
+        try {
+          const entry = resolveSshConfig(hopHost, undefined);
+          if (entry) {
+            if (!hopUser && entry.user) hopUser = entry.user;
+            if (entry.hostName) hopHost = entry.hostName;
+            if (entry.port) hopPort = entry.port;
+          }
+        } catch (e) {
+          // Ignore SSH config errors for jump hosts
+        }
+        if (!hopUser) hopUser = userInfo().username;
+      }
+
+      const conn = new Client();
+
+      await new Promise<void>((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+          conn.end();
+          reject(new McpError(ErrorCode.InternalError, `SSH connection timeout at hop ${i + 1} (${hopHost}:${hopPort})`));
+        }, 30000);
+
+        conn.on('ready', () => {
+          clearTimeout(timeoutId);
+          resolve();
+        });
+
+        conn.on('error', (err: Error) => {
+          clearTimeout(timeoutId);
+          reject(new McpError(ErrorCode.InternalError, `SSH connection error at hop ${i + 1} (${hopHost}:${hopPort}): ${err.message}`));
+        });
+
+        const connectConfig: any = {
+          host: hopHost,
+          port: hopPort,
+          username: hopUser,
+        };
+        if (auth.password) connectConfig.password = auth.password;
+        if (auth.privateKey) connectConfig.privateKey = auth.privateKey;
+        if (currentSock) connectConfig.sock = currentSock;
+
+        conn.connect(connectConfig);
+      });
+
+      if (isLast) {
+        // This is the target — store as the main connection
+        this.conn = conn;
+
+        // Set up event handlers for connection lifecycle tracking
+        conn.on('end', () => {
+          console.error('SSH connection ended');
+          this.conn = null;
+          this.isConnecting = false;
+          this.connectionPromise = null;
+        });
+        conn.on('close', () => {
+          console.error('SSH connection closed');
+          this.conn = null;
+          this.isConnecting = false;
+          this.connectionPromise = null;
+        });
+
+        // Handle su elevation if needed
+        if (this.sshConfig.suPassword && !process.env.SSH_MCP_TEST) {
+          try {
+            await this.ensureElevated();
+          } catch (err) {
+            // Non-fatal: fall back to normal execution
+          }
+        }
+      } else {
+        // Intermediate hop — save connection and create tunnel to next hop
+        this.intermediateConns.push(conn);
+
+        const nextHop = chain[i + 1];
+        let nextHost = nextHop.host;
+        let nextPort = nextHop.port;
+
+        // Resolve next hop's actual hostname/port via SSH config
+        if (!nextHop.user) {
+          try {
+            const entry = resolveSshConfig(nextHost, undefined);
+            if (entry) {
+              if (entry.hostName) nextHost = entry.hostName;
+              if (entry.port) nextPort = entry.port;
+            }
+          } catch (e) {
+            // Ignore
+          }
+        }
+
+        currentSock = await new Promise<ClientChannel>((resolve, reject) => {
+          conn.forwardOut('127.0.0.1', 0, nextHost, nextPort, (err, stream) => {
+            if (err) {
+              reject(new McpError(ErrorCode.InternalError, `Failed to tunnel through hop ${i + 1} to ${nextHost}:${nextPort}: ${err.message}`));
+            } else {
+              resolve(stream);
+            }
+          });
+        });
+
+        currentConn = conn;
+      }
+    }
+
+    this.isConnecting = false;
   }
 
   isConnected(): boolean {
@@ -563,6 +751,11 @@ export class SSHConnectionManager {
       this.conn.end();
       this.conn = null;
     }
+    // Close intermediate jump host connections (in reverse order)
+    for (let i = this.intermediateConns.length - 1; i >= 0; i--) {
+      try { this.intermediateConns[i].end(); } catch (e) { /* ignore */ }
+    }
+    this.intermediateConns = [];
   }
 }
 
@@ -571,7 +764,7 @@ let connectionManager: SSHConnectionManager | null = null;
 const server = new McpServer(
   {
     name: 'SSH MCP Server',
-    version: '1.6.1',
+    version: '1.7.0',
   },
   {
     capabilities: {
